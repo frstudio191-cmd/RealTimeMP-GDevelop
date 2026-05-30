@@ -1,0 +1,2007 @@
+{
+  "author": "RealTimeMP Extension",
+  "category": "Network",
+  "description": "## 🌐 RealTimeMP - Real-Time Multiplayer for GDevelop 5\n\nA complete, fully customizable real-time multiplayer extension. Connect to **any** WebSocket server — your own, a free service, or a local server.\n\n### ✅ Features\n- Connect/disconnect to **any** WebSocket server URL\n- Room system: create, join, leave rooms with optional passwords\n- Full **player state sync** (position, angle, custom data)\n- **Room variables** shared between all players\n- **Custom events** (broadcast or targeted to one player)\n- **Remote Procedure Calls (RPC)** — trigger actions on other clients\n- **In-game chat** system\n- **Lobby list** — list all available rooms\n- **Host migration** — new host assigned automatically if host leaves\n- **Latency / ping** measurement per player\n- **Object synchronization** — sync any game object position\n- **Kick player** (host only)\n- All data structures exposed as GDevelop variables\n\n### 🛠 Setup\n1. Import this extension into your GDevelop project\n2. Deploy the included Node.js server (server code in the description below)\n3. Use `Connect to server` action on scene start\n4. Use `Join Room` or `Create Room`\n5. Use `Send Player State` every frame\n\n### 🖥 Free server options\n- Run locally with Node.js\n- Deploy to Railway, Render, Fly.io, or Glitch (all free tiers)\n\n---\n```javascript\n// Minimal Node.js server (save as server.js, run: node server.js)\nconst WebSocket = require('ws');\nconst wss = new WebSocket.Server({ port: process.env.PORT || 8080 });\nconst players = new Map();\nconst rooms = new Map();\nlet playerIdCounter = 0;\n\nfunction broadcast(room, msg, excludeId) {\n  const r = rooms.get(room);\n  if (!r) return;\n  const str = JSON.stringify(msg);\n  for (const pid of r.players) {\n    if (pid === excludeId) continue;\n    const p = players.get(pid);\n    if (p && p.ws.readyState === 1) p.ws.send(str);\n  }\n}\nfunction sendTo(pid, msg) {\n  const p = players.get(pid);\n  if (p && p.ws.readyState === 1) p.ws.send(JSON.stringify(msg));\n}\n\nwss.on('connection', (ws) => {\n  const playerId = 'p' + (++playerIdCounter);\n  const player = { id: playerId, name: '', room: null, ws };\n  players.set(playerId, player);\n  ws.send(JSON.stringify({ type: 'welcome', playerId }));\n\n  ws.on('message', (raw) => {\n    let msg; try { msg = JSON.parse(raw); } catch { return; }\n\n    if (msg.type === 'identify') {\n      player.name = msg.name || 'Player';\n    }\n    else if (msg.type === 'ping') {\n      ws.send(JSON.stringify({ type: 'pong', t: msg.t }));\n    }\n    else if (msg.type === 'create_room') {\n      const rid = 'room_' + Date.now();\n      const room = { id: rid, name: msg.roomName || rid, host: playerId, players: new Set([playerId]), variables: {}, password: msg.password || '', maxPlayers: msg.maxPlayers || 8, isPrivate: msg.isPrivate || false };\n      rooms.set(rid, room);\n      player.room = rid;\n      const playerData = {};\n      playerData[playerId] = { name: player.name };\n      ws.send(JSON.stringify({ type: 'room_joined', roomId: rid, isHost: true, players: playerData, variables: {} }));\n    }\n    else if (msg.type === 'join_room') {\n      const room = rooms.get(msg.roomId);\n      if (!room) { ws.send(JSON.stringify({ type: 'error', message: 'Room not found' })); return; }\n      if (room.password && room.password !== msg.password) { ws.send(JSON.stringify({ type: 'error', message: 'Wrong password' })); return; }\n      if (room.players.size >= room.maxPlayers) { ws.send(JSON.stringify({ type: 'error', message: 'Room full' })); return; }\n      room.players.add(playerId);\n      player.room = msg.roomId;\n      const pData = {};\n      for (const pid of room.players) { const p2 = players.get(pid); if (p2) pData[pid] = { name: p2.name }; }\n      ws.send(JSON.stringify({ type: 'room_joined', roomId: msg.roomId, isHost: playerId === room.host, players: pData, variables: room.variables }));\n      broadcast(msg.roomId, { type: 'player_joined', playerId, playerName: player.name, playerData: { name: player.name } }, playerId);\n    }\n    else if (msg.type === 'leave_room') {\n      if (!player.room) return;\n      const rid = player.room;\n      const room = rooms.get(rid);\n      if (room) {\n        room.players.delete(playerId);\n        broadcast(rid, { type: 'player_left', playerId });\n        if (room.host === playerId && room.players.size > 0) {\n          room.host = [...room.players][0];\n          broadcast(rid, { type: 'host_changed', newHostId: room.host });\n          sendTo(room.host, { type: 'host_changed', newHostId: room.host });\n        }\n        if (room.players.size === 0) rooms.delete(rid);\n      }\n      player.room = null;\n      ws.send(JSON.stringify({ type: 'room_left' }));\n    }\n    else if (msg.type === 'player_state') {\n      if (player.room) broadcast(player.room, { type: 'player_state', playerId, state: msg.state }, playerId);\n    }\n    else if (msg.type === 'custom_event') {\n      const evtMsg = { type: 'custom_event', name: msg.name, data: msg.data, senderId: playerId };\n      if (msg.target && msg.target !== '') sendTo(msg.target, evtMsg);\n      else if (player.room) broadcast(player.room, evtMsg, playerId);\n    }\n    else if (msg.type === 'rpc') {\n      const rpcMsg = { type: 'rpc', name: msg.name, args: msg.args, senderId: playerId };\n      if (msg.target && msg.target !== '') sendTo(msg.target, rpcMsg);\n      else if (player.room) broadcast(player.room, rpcMsg, playerId);\n    }\n    else if (msg.type === 'chat') {\n      if (player.room) broadcast(player.room, { type: 'chat', senderId: playerId, senderName: player.name, text: msg.text }, null);\n    }\n    else if (msg.type === 'room_variable') {\n      const room = rooms.get(player.room);\n      if (room) {\n        room.variables[msg.key] = msg.value;\n        broadcast(player.room, { type: 'room_variable', key: msg.key, value: msg.value }, null);\n      }\n    }\n    else if (msg.type === 'object_sync') {\n      if (player.room) broadcast(player.room, { type: 'object_sync', objects: msg.objects }, playerId);\n    }\n    else if (msg.type === 'get_lobby') {\n      const list = [];\n      for (const [rid, r] of rooms.entries()) {\n        if (!r.isPrivate) list.push({ id: rid, name: r.name, playerCount: r.players.size, maxPlayers: r.maxPlayers, locked: !!r.password });\n      }\n      ws.send(JSON.stringify({ type: 'lobby_list', rooms: list }));\n    }\n    else if (msg.type === 'kick') {\n      const room = rooms.get(player.room);\n      if (room && room.host === playerId) {\n        sendTo(msg.targetId, { type: 'kicked', reason: msg.reason || '' });\n        room.players.delete(msg.targetId);\n        broadcast(player.room, { type: 'player_left', playerId: msg.targetId }, msg.targetId);\n        const kicked = players.get(msg.targetId);\n        if (kicked) { kicked.room = null; kicked.ws.close(); }\n      }\n    }\n  });\n\n  ws.on('close', () => {\n    if (player.room) {\n      const room = rooms.get(player.room);\n      if (room) {\n        room.players.delete(playerId);\n        broadcast(player.room, { type: 'player_left', playerId });\n        if (room.host === playerId && room.players.size > 0) {\n          room.host = [...room.players][0];\n          broadcast(player.room, { type: 'host_changed', newHostId: room.host });\n        }\n        if (room.players.size === 0) rooms.delete(player.room);\n      }\n    }\n    players.delete(playerId);\n  });\n});\nconsole.log('RealTimeMP server running');\n```",
+  "extensionNamespace": "",
+  "gdevelopVersion": ">=5.4.0",
+  "fullName": "RealTimeMP - Real-Time Multiplayer",
+  "helpPath": "",
+  "name": "RealTimeMP",
+  "previewIconUrl": "https://resources.gdevelop-app.com/assets/Icons/Line Hero Pack/Master/SVG/Communication/Communication_pc_server_sync_sharing.svg",
+  "shortDescription": "Complete real-time multiplayer: rooms, player sync, custom events, RPC, chat, lobby — connect to any WebSocket server.",
+  "version": "1.0.0",
+  "tags": [
+    "multiplayer",
+    "websocket",
+    "network",
+    "online",
+    "realtime",
+    "rooms",
+    "sync",
+    "p2p",
+    "server"
+  ],
+  "dependencies": [],
+  "iconUrl": "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4KPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+CiAgPGNpcmNsZSBjeD0iMTYiIGN5PSIxNiIgcj0iMTQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzAwMCIgc3Ryb2tlLXdpZHRoPSIyIi8+CiAgPHBhdGggZD0iTTE2IDJhMTQgMTQgMCAwIDEgMCAyOCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMDAwIiBzdHJva2Utd2lkdGg9IjIiLz4KICA8cGF0aCBkPSJNMiAxNmgyOCIgc3Ryb2tlPSIjMDAwIiBzdHJva2Utd2lkdGg9IjIiLz4KPC9zdmc+",
+  "eventsFunctions": [
+    {
+      "description": "",
+      "fullName": "On Scene Loaded (internal)",
+      "functionType": "Action",
+      "name": "onFirstSceneLoaded",
+      "private": true,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nif (!gdjs.RealTimeMP) {\n    gdjs.RealTimeMP = {\n        // --- Connection state ---\n        socket: null,\n        serverUrl: \"\",\n        roomId: \"\",\n        playerId: \"\",\n        playerName: \"\",\n        isHost: false,\n        connectionStatus: \"disconnected\", // disconnected | connecting | connected | error\n        lastError: \"\",\n\n        // --- Room state ---\n        roomPlayers: {},       // { playerId: { name, x, y, angle, data, ping, latency } }\n        roomVariables: {},     // { key: value }\n        customEvents: [],      // [ { name, senderId, data } ]\n        chatMessages: [],      // [ { senderId, senderName, text, timestamp } ]\n        playerCount: 0,\n\n        // --- Object sync ---\n        syncObjects: {},       // { objectName: { x, y, angle, scaleX, scaleY, visible, animation, zOrder, data } }\n        \n        // --- RPC queue ---\n        rpcQueue: [],          // [ { name, args, senderId } ]\n\n        // --- Ping / latency ---\n        pingInterval: null,\n        latency: 0,\n        pingSentAt: 0,\n\n        // --- Lobby ---\n        lobbyRooms: [],        // [ { id, name, playerCount, maxPlayers, locked } ]\n\n        // --- Prediction / Reconciliation ---\n        inputBuffer: [],\n\n        // --- Timers ---\n        tickInterval: null,\n        syncRate: 50,  // ms\n\n        // --- Flags ---\n        justConnected: false,\n        justDisconnected: false,\n        justJoinedRoom: false,\n        justLeftRoom: false,\n        playerJustJoined: \"\",\n        playerJustLeft: \"\",\n        hostChanged: false,\n        newHostId: \"\",\n\n        // ============================================================\n        _reset: function() {\n            if (this.pingInterval) clearInterval(this.pingInterval);\n            if (this.tickInterval) clearInterval(this.tickInterval);\n            this.socket = null;\n            this.connectionStatus = \"disconnected\";\n            this.roomId = \"\";\n            this.playerId = \"\";\n            this.isHost = false;\n            this.roomPlayers = {};\n            this.roomVariables = {};\n            this.customEvents = [];\n            this.chatMessages = [];\n            this.syncObjects = {};\n            this.rpcQueue = [];\n            this.lobbyRooms = [];\n            this.playerCount = 0;\n        },\n\n        // ============================================================\n        _send: function(msgObj) {\n            if (this.socket && this.socket.readyState === WebSocket.OPEN) {\n                this.socket.send(JSON.stringify(msgObj));\n                return true;\n            }\n            return false;\n        },\n\n        // ============================================================\n        _handleMessage: function(rawData) {\n            let msg;\n            try { msg = JSON.parse(rawData); } catch(e) { return; }\n            const t = msg.type;\n\n            if (t === \"welcome\") {\n                this.playerId = msg.playerId;\n                this.connectionStatus = \"connected\";\n                this.justConnected = true;\n                // start ping\n                this.pingSentAt = Date.now();\n                this._send({ type: \"ping\", t: this.pingSentAt });\n                this.pingInterval = setInterval(() => {\n                    this.pingSentAt = Date.now();\n                    this._send({ type: \"ping\", t: this.pingSentAt });\n                }, 2000);\n            }\n            else if (t === \"pong\") {\n                this.latency = Math.round((Date.now() - msg.t) / 2);\n                if (this.roomPlayers[this.playerId]) {\n                    this.roomPlayers[this.playerId].latency = this.latency;\n                }\n            }\n            else if (t === \"room_joined\") {\n                this.roomId = msg.roomId;\n                this.isHost = msg.isHost || false;\n                this.roomPlayers = msg.players || {};\n                this.roomVariables = msg.variables || {};\n                this.playerCount = Object.keys(this.roomPlayers).length;\n                this.justJoinedRoom = true;\n            }\n            else if (t === \"room_left\") {\n                this.roomId = \"\";\n                this.isHost = false;\n                this.roomPlayers = {};\n                this.roomVariables = {};\n                this.playerCount = 0;\n                this.justLeftRoom = true;\n            }\n            else if (t === \"player_joined\") {\n                this.roomPlayers[msg.playerId] = msg.playerData || { name: msg.playerName || \"\", x:0, y:0, angle:0, data:{} };\n                this.playerCount = Object.keys(this.roomPlayers).length;\n                this.playerJustJoined = msg.playerId;\n            }\n            else if (t === \"player_left\") {\n                delete this.roomPlayers[msg.playerId];\n                this.playerCount = Object.keys(this.roomPlayers).length;\n                this.playerJustLeft = msg.playerId;\n            }\n            else if (t === \"host_changed\") {\n                this.isHost = (msg.newHostId === this.playerId);\n                this.newHostId = msg.newHostId;\n                this.hostChanged = true;\n            }\n            else if (t === \"state_sync\") {\n                // batch sync of all players\n                const states = msg.states || {};\n                for (const [pid, state] of Object.entries(states)) {\n                    if (!this.roomPlayers[pid]) this.roomPlayers[pid] = {};\n                    Object.assign(this.roomPlayers[pid], state);\n                }\n            }\n            else if (t === \"player_state\") {\n                const pid = msg.playerId;\n                if (!this.roomPlayers[pid]) this.roomPlayers[pid] = {};\n                Object.assign(this.roomPlayers[pid], msg.state);\n            }\n            else if (t === \"object_sync\") {\n                const objs = msg.objects || {};\n                for (const [objId, objState] of Object.entries(objs)) {\n                    this.syncObjects[objId] = objState;\n                }\n            }\n            else if (t === \"room_variable\") {\n                this.roomVariables[msg.key] = msg.value;\n            }\n            else if (t === \"custom_event\") {\n                this.customEvents.push({ name: msg.name, senderId: msg.senderId, data: msg.data || \"\" });\n            }\n            else if (t === \"rpc\") {\n                this.rpcQueue.push({ name: msg.name, args: msg.args || [], senderId: msg.senderId });\n            }\n            else if (t === \"chat\") {\n                this.chatMessages.push({ senderId: msg.senderId, senderName: msg.senderName || \"\", text: msg.text, timestamp: Date.now() });\n                if (this.chatMessages.length > 100) this.chatMessages.shift();\n            }\n            else if (t === \"lobby_list\") {\n                this.lobbyRooms = msg.rooms || [];\n            }\n            else if (t === \"error\") {\n                this.lastError = msg.message || \"Unknown error\";\n                this.connectionStatus = \"error\";\n            }\n            else if (t === \"kicked\") {\n                this.lastError = \"Kicked: \" + (msg.reason || \"\");\n                if (this.socket) this.socket.close();\n            }\n        }\n    };\n}\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "",
+      "fullName": "On Scene Post Events (internal)",
+      "functionType": "Action",
+      "name": "onScenePostEvents",
+      "private": true,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nif (!mp) return;\n// Reset per-frame flags\nmp.justConnected = false;\nmp.justDisconnected = false;\nmp.justJoinedRoom = false;\nmp.justLeftRoom = false;\nmp.playerJustJoined = \"\";\nmp.playerJustLeft = \"\";\nmp.hostChanged = false;\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "",
+      "fullName": "On Scene Unloading (internal)",
+      "functionType": "Action",
+      "name": "onSceneUnloading",
+      "private": true,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nif (mp) {\n    if (mp.pingInterval) clearInterval(mp.pingInterval);\n    if (mp.tickInterval) clearInterval(mp.tickInterval);\n    if (mp.socket) mp.socket.close();\n    gdjs.RealTimeMP = null;\n}\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Connect to a WebSocket multiplayer server.",
+      "fullName": "Connect to server",
+      "functionType": "Action",
+      "name": "Connect",
+      "private": false,
+      "sentence": "Connect to server _PARAM1_ as player _PARAM2_",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nconst url = eventsFunctionContext.getArgument(\"serverUrl\");\nconst playerName = eventsFunctionContext.getArgument(\"playerName\");\n\nmp._reset();\nmp.serverUrl = url;\nmp.playerName = playerName;\nmp.connectionStatus = \"connecting\";\n\nmp.socket = new WebSocket(url);\n\nmp.socket.addEventListener(\"open\", () => {\n    mp._send({ type: \"identify\", name: playerName });\n});\n\nmp.socket.addEventListener(\"message\", (e) => {\n    mp._handleMessage(e.data);\n});\n\nmp.socket.addEventListener(\"error\", (e) => {\n    mp.connectionStatus = \"error\";\n    mp.lastError = \"Connection error\";\n});\n\nmp.socket.addEventListener(\"close\", () => {\n    mp.justDisconnected = true;\n    mp.connectionStatus = \"disconnected\";\n    if (mp.pingInterval) clearInterval(mp.pingInterval);\n});\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Server URL (e.g. ws://localhost:8080)",
+          "longDescription": "",
+          "name": "serverUrl",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Player name",
+          "longDescription": "",
+          "name": "playerName",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Disconnect from the server.",
+      "fullName": "Disconnect from server",
+      "functionType": "Action",
+      "name": "Disconnect",
+      "private": false,
+      "sentence": "Disconnect from server",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nif (mp && mp.socket) {\n    mp.socket.close(1000, \"User disconnected\");\n}\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Create a new room. Optionally add a password and set it as private.",
+      "fullName": "Create room",
+      "functionType": "Action",
+      "name": "CreateRoom",
+      "private": false,
+      "sentence": "Create room named _PARAM1_ max _PARAM2_ players (password: _PARAM3_, private: _PARAM4_)",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nconst roomName = eventsFunctionContext.getArgument(\"roomName\");\nconst maxPlayers = eventsFunctionContext.getArgument(\"maxPlayers\");\nconst password = eventsFunctionContext.getArgument(\"password\");\nconst isPrivate = eventsFunctionContext.getArgument(\"isPrivate\") === \"true\" || eventsFunctionContext.getArgument(\"isPrivate\") === true;\nmp._send({ type: \"create_room\", roomName, maxPlayers: parseInt(maxPlayers)||8, password, isPrivate });\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Room name",
+          "longDescription": "",
+          "name": "roomName",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "8",
+          "description": "Max players (number)",
+          "longDescription": "",
+          "name": "maxPlayers",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "expression"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Password (leave empty for none)",
+          "longDescription": "",
+          "name": "password",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "false",
+          "description": "Private room (true/false)",
+          "longDescription": "",
+          "name": "isPrivate",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Join an existing room by ID. Use the lobby to get room IDs.",
+      "fullName": "Join room",
+      "functionType": "Action",
+      "name": "JoinRoom",
+      "private": false,
+      "sentence": "Join room _PARAM1_ with password _PARAM2_",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nconst roomId = eventsFunctionContext.getArgument(\"roomId\");\nconst password = eventsFunctionContext.getArgument(\"password\");\nmp._send({ type: \"join_room\", roomId, password });\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Room ID",
+          "longDescription": "",
+          "name": "roomId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Password (leave empty if none)",
+          "longDescription": "",
+          "name": "password",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Leave the current room.",
+      "fullName": "Leave room",
+      "functionType": "Action",
+      "name": "LeaveRoom",
+      "private": false,
+      "sentence": "Leave current room",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nmp._send({ type: \"leave_room\" });\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Request the list of available public rooms from the server. Use LobbyRoomCount() and LobbyRoomData() to read results.",
+      "fullName": "Request lobby list",
+      "functionType": "Action",
+      "name": "RequestLobbyList",
+      "private": false,
+      "sentence": "Request lobby list from server",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nmp._send({ type: \"get_lobby\" });\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Send this player's position, angle, and custom data to all other players in the room. Call this every frame.",
+      "fullName": "Send player state",
+      "functionType": "Action",
+      "name": "SendPlayerState",
+      "private": false,
+      "sentence": "Send player state X:_PARAM1_ Y:_PARAM2_ Angle:_PARAM3_ Data:_PARAM4_",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nconst x = eventsFunctionContext.getArgument(\"x\");\nconst y = eventsFunctionContext.getArgument(\"y\");\nconst angle = eventsFunctionContext.getArgument(\"angle\");\nconst customData = eventsFunctionContext.getArgument(\"customData\");\nmp._send({\n    type: \"player_state\",\n    state: { x: parseFloat(x)||0, y: parseFloat(y)||0, angle: parseFloat(angle)||0, data: customData, name: mp.playerName, latency: mp.latency }\n});\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "X position",
+          "longDescription": "",
+          "name": "x",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "expression"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Y position",
+          "longDescription": "",
+          "name": "y",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "expression"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "0",
+          "description": "Angle (degrees)",
+          "longDescription": "",
+          "name": "angle",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "expression"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Custom data (JSON string or any string)",
+          "longDescription": "",
+          "name": "customData",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Send a custom named event with data to other players. Leave target empty to broadcast to all in room.",
+      "fullName": "Send custom event",
+      "functionType": "Action",
+      "name": "SendCustomEvent",
+      "private": false,
+      "sentence": "Send event _PARAM1_ with data _PARAM2_ to player _PARAM3_ (empty = all)",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nconst name = eventsFunctionContext.getArgument(\"eventName\");\nconst data = eventsFunctionContext.getArgument(\"eventData\");\nconst target = eventsFunctionContext.getArgument(\"targetId\"); // \"\" = broadcast\nmp._send({ type: \"custom_event\", name, data, target });\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Event name",
+          "longDescription": "",
+          "name": "eventName",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Event data (string)",
+          "longDescription": "",
+          "name": "eventData",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Target player ID (empty = broadcast)",
+          "longDescription": "",
+          "name": "targetId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Mark the current custom event as processed and move to the next one.",
+      "fullName": "Mark custom event as handled",
+      "functionType": "Action",
+      "name": "FlushCustomEvent",
+      "private": false,
+      "sentence": "Mark current custom event as handled",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nif (mp.customEvents.length > 0) mp.customEvents.pop();\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Call a named function on another player's game. Args must be a JSON array string e.g. '[1, \"hello\"]'.",
+      "fullName": "Call remote procedure (RPC)",
+      "functionType": "Action",
+      "name": "CallRPC",
+      "private": false,
+      "sentence": "Call RPC _PARAM1_ with args _PARAM2_ on player _PARAM3_ (empty = all)",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nconst name = eventsFunctionContext.getArgument(\"rpcName\");\nconst args = eventsFunctionContext.getArgument(\"argsJson\");\nconst target = eventsFunctionContext.getArgument(\"targetId\");\nmp._send({ type: \"rpc\", name, args: JSON.parse(args||\"[]\"), target });\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "RPC function name",
+          "longDescription": "",
+          "name": "rpcName",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "[]",
+          "description": "Arguments as JSON array (e.g. [1, 2])",
+          "longDescription": "",
+          "name": "argsJson",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Target player ID (empty = all)",
+          "longDescription": "",
+          "name": "targetId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Mark the current RPC call as processed.",
+      "fullName": "Mark RPC as handled",
+      "functionType": "Action",
+      "name": "FlushRPC",
+      "private": false,
+      "sentence": "Mark current RPC call as handled",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nif (mp.rpcQueue.length > 0) mp.rpcQueue.pop();\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Set a shared room variable visible to all players.",
+      "fullName": "Set room variable",
+      "functionType": "Action",
+      "name": "SetRoomVariable",
+      "private": false,
+      "sentence": "Set room variable _PARAM1_ to _PARAM2_",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nconst key = eventsFunctionContext.getArgument(\"key\");\nconst value = eventsFunctionContext.getArgument(\"value\");\nmp._send({ type: \"room_variable\", key, value });\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Variable key",
+          "longDescription": "",
+          "name": "key",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Value (string)",
+          "longDescription": "",
+          "name": "value",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Send a chat message to all players in the room.",
+      "fullName": "Send chat message",
+      "functionType": "Action",
+      "name": "SendChatMessage",
+      "private": false,
+      "sentence": "Send chat message _PARAM1_",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nconst text = eventsFunctionContext.getArgument(\"text\");\nmp._send({ type: \"chat\", text, senderName: mp.playerName });\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Message text",
+          "longDescription": "",
+          "name": "text",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Mark the current chat message as read.",
+      "fullName": "Mark chat message as read",
+      "functionType": "Action",
+      "name": "FlushChatMessage",
+      "private": false,
+      "sentence": "Mark current chat message as read",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nif (mp.chatMessages.length > 0) mp.chatMessages.shift();\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Sync an object's state to all players. Only call from host.",
+      "fullName": "Sync object (host only)",
+      "functionType": "Action",
+      "name": "SyncObject",
+      "private": false,
+      "sentence": "Sync object _PARAM1_ at X:_PARAM2_ Y:_PARAM3_ Angle:_PARAM4_ Data:_PARAM5_",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nconst objId = eventsFunctionContext.getArgument(\"objectId\");\nconst x = parseFloat(eventsFunctionContext.getArgument(\"x\"))||0;\nconst y = parseFloat(eventsFunctionContext.getArgument(\"y\"))||0;\nconst angle = parseFloat(eventsFunctionContext.getArgument(\"angle\"))||0;\nconst extra = eventsFunctionContext.getArgument(\"extraData\");\nmp._send({ type: \"object_sync\", objects: { [objId]: { x, y, angle, extra } } });\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Object ID (unique name)",
+          "longDescription": "",
+          "name": "objectId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "X",
+          "longDescription": "",
+          "name": "x",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "expression"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Y",
+          "longDescription": "",
+          "name": "y",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "expression"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "0",
+          "description": "Angle",
+          "longDescription": "",
+          "name": "angle",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "expression"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Extra data",
+          "longDescription": "",
+          "name": "extraData",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Kick a player from the room. Only works if you are the host.",
+      "fullName": "Kick player (host only)",
+      "functionType": "Action",
+      "name": "KickPlayer",
+      "private": false,
+      "sentence": "Kick player _PARAM1_ with reason _PARAM2_",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "\nconst mp = gdjs.RealTimeMP;\nconst pid = eventsFunctionContext.getArgument(\"playerId\");\nconst reason = eventsFunctionContext.getArgument(\"reason\");\nmp._send({ type: \"kick\", targetId: pid, reason });\n",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Player ID to kick",
+          "longDescription": "",
+          "name": "playerId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        },
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Reason",
+          "longDescription": "",
+          "name": "reason",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Check if connected to the server.",
+      "fullName": "Is connected to server",
+      "functionType": "Condition",
+      "name": "IsConnected",
+      "private": false,
+      "sentence": "Is connected to server",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.connectionStatus === 'connected');",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Check if currently connecting.",
+      "fullName": "Is connecting to server",
+      "functionType": "Condition",
+      "name": "IsConnecting",
+      "private": false,
+      "sentence": "Is connecting to server",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.connectionStatus === 'connecting');",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Check if disconnected.",
+      "fullName": "Is disconnected",
+      "functionType": "Condition",
+      "name": "IsDisconnected",
+      "private": false,
+      "sentence": "Is disconnected from server",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !gdjs.RealTimeMP || gdjs.RealTimeMP.connectionStatus === 'disconnected';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Check if the player is currently in a room.",
+      "fullName": "Is in a room",
+      "functionType": "Condition",
+      "name": "IsInRoom",
+      "private": false,
+      "sentence": "Is in a room",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.roomId !== '');",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Check if this player is the current room host.",
+      "fullName": "Is host",
+      "functionType": "Condition",
+      "name": "IsHost",
+      "private": false,
+      "sentence": "Is room host",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.isHost);",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "True for one frame when connection is established.",
+      "fullName": "Just connected",
+      "functionType": "Condition",
+      "name": "JustConnected",
+      "private": false,
+      "sentence": "Just connected to server",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.justConnected);",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "True for one frame when disconnected.",
+      "fullName": "Just disconnected",
+      "functionType": "Condition",
+      "name": "JustDisconnected",
+      "private": false,
+      "sentence": "Just disconnected from server",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.justDisconnected);",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "True for one frame when room is joined.",
+      "fullName": "Just joined room",
+      "functionType": "Condition",
+      "name": "JustJoinedRoom",
+      "private": false,
+      "sentence": "Just joined a room",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.justJoinedRoom);",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "True for one frame when room is left.",
+      "fullName": "Just left room",
+      "functionType": "Condition",
+      "name": "JustLeftRoom",
+      "private": false,
+      "sentence": "Just left a room",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.justLeftRoom);",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "True for one frame when any player joins the room.",
+      "fullName": "A player just joined",
+      "functionType": "Condition",
+      "name": "PlayerJustJoined",
+      "private": false,
+      "sentence": "A player just joined the room",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.playerJustJoined !== '');",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "True for one frame when any player leaves the room.",
+      "fullName": "A player just left",
+      "functionType": "Condition",
+      "name": "PlayerJustLeft",
+      "private": false,
+      "sentence": "A player just left the room",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.playerJustLeft !== '');",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "True for one frame when the host changes.",
+      "fullName": "Host changed",
+      "functionType": "Condition",
+      "name": "HostChanged",
+      "private": false,
+      "sentence": "Host player changed",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.hostChanged);",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "True if a connection error occurred.",
+      "fullName": "Has connection error",
+      "functionType": "Condition",
+      "name": "HasError",
+      "private": false,
+      "sentence": "Connection error occurred",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.connectionStatus === 'error');",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "True while there are unhandled custom events in the queue.",
+      "fullName": "Custom event received",
+      "functionType": "Condition",
+      "name": "CustomEventReceived",
+      "private": false,
+      "sentence": "Custom event received",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.customEvents.length > 0);",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Check the name of the current custom event.",
+      "fullName": "Current event name is",
+      "functionType": "Condition",
+      "name": "CustomEventIs",
+      "private": false,
+      "sentence": "Current event name is _PARAM1_",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp = gdjs.RealTimeMP;\neventsFunctionContext.returnValue = !!(mp && mp.customEvents.length > 0 && mp.customEvents[mp.customEvents.length-1].name === eventsFunctionContext.getArgument('name'));",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Event name to check",
+          "longDescription": "",
+          "name": "name",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "True while there are pending RPC calls.",
+      "fullName": "RPC call received",
+      "functionType": "Condition",
+      "name": "RPCReceived",
+      "private": false,
+      "sentence": "RPC call received",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.rpcQueue.length > 0);",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Check the name of the current RPC call.",
+      "fullName": "Current RPC name is",
+      "functionType": "Condition",
+      "name": "RPCIs",
+      "private": false,
+      "sentence": "Current RPC name is _PARAM1_",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp = gdjs.RealTimeMP;\neventsFunctionContext.returnValue = !!(mp && mp.rpcQueue.length > 0 && mp.rpcQueue[mp.rpcQueue.length-1].name === eventsFunctionContext.getArgument('name'));",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "RPC name to check",
+          "longDescription": "",
+          "name": "name",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "True while there are unread chat messages.",
+      "fullName": "Chat message received",
+      "functionType": "Condition",
+      "name": "ChatMessageReceived",
+      "private": false,
+      "sentence": "Chat message received",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = !!(gdjs.RealTimeMP && gdjs.RealTimeMP.chatMessages.length > 0);",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "The unique ID of this player assigned by the server.",
+      "fullName": "My player ID",
+      "functionType": "StringExpression",
+      "name": "MyPlayerId",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = gdjs.RealTimeMP ? gdjs.RealTimeMP.playerId : '';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "This player's name.",
+      "fullName": "My player name",
+      "functionType": "StringExpression",
+      "name": "MyPlayerName",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = gdjs.RealTimeMP ? gdjs.RealTimeMP.playerName : '';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "The ID of the current room.",
+      "fullName": "Current room ID",
+      "functionType": "StringExpression",
+      "name": "RoomId",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = gdjs.RealTimeMP ? gdjs.RealTimeMP.roomId : '';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Returns: disconnected, connecting, connected, or error.",
+      "fullName": "Connection status",
+      "functionType": "StringExpression",
+      "name": "ConnectionStatus",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = gdjs.RealTimeMP ? gdjs.RealTimeMP.connectionStatus : 'disconnected';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "The last error message from the server.",
+      "fullName": "Last error message",
+      "functionType": "StringExpression",
+      "name": "LastError",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = gdjs.RealTimeMP ? gdjs.RealTimeMP.lastError : '';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Number of players currently in the room.",
+      "fullName": "Player count in room",
+      "functionType": "Expression",
+      "name": "PlayerCount",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = gdjs.RealTimeMP ? gdjs.RealTimeMP.playerCount : 0;",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "This player's latency to the server in milliseconds.",
+      "fullName": "My latency (ms)",
+      "functionType": "Expression",
+      "name": "Latency",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = gdjs.RealTimeMP ? gdjs.RealTimeMP.latency : 0;",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the X position of a player by their ID.",
+      "fullName": "Player X position",
+      "functionType": "Expression",
+      "name": "PlayerX",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const p=mp&&mp.roomPlayers[eventsFunctionContext.getArgument('playerId')]; eventsFunctionContext.returnValue=p?p.x||0:0;",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Player ID",
+          "longDescription": "",
+          "name": "playerId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the Y position of a player by their ID.",
+      "fullName": "Player Y position",
+      "functionType": "Expression",
+      "name": "PlayerY",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const p=mp&&mp.roomPlayers[eventsFunctionContext.getArgument('playerId')]; eventsFunctionContext.returnValue=p?p.y||0:0;",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Player ID",
+          "longDescription": "",
+          "name": "playerId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the angle of a player by their ID.",
+      "fullName": "Player angle",
+      "functionType": "Expression",
+      "name": "PlayerAngle",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const p=mp&&mp.roomPlayers[eventsFunctionContext.getArgument('playerId')]; eventsFunctionContext.returnValue=p?p.angle||0:0;",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Player ID",
+          "longDescription": "",
+          "name": "playerId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the name of a player by their ID.",
+      "fullName": "Player name",
+      "functionType": "StringExpression",
+      "name": "PlayerName",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const p=mp&&mp.roomPlayers[eventsFunctionContext.getArgument('playerId')]; eventsFunctionContext.returnValue=p?p.name||'':''",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Player ID",
+          "longDescription": "",
+          "name": "playerId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the custom data string of a player by their ID.",
+      "fullName": "Player custom data",
+      "functionType": "StringExpression",
+      "name": "PlayerData",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const p=mp&&mp.roomPlayers[eventsFunctionContext.getArgument('playerId')]; eventsFunctionContext.returnValue=p?String(p.data||''):'';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Player ID",
+          "longDescription": "",
+          "name": "playerId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the latency of a specific player.",
+      "fullName": "Player latency (ms)",
+      "functionType": "Expression",
+      "name": "PlayerLatency",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const p=mp&&mp.roomPlayers[eventsFunctionContext.getArgument('playerId')]; eventsFunctionContext.returnValue=p?p.latency||0:0;",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Player ID",
+          "longDescription": "",
+          "name": "playerId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the value of a shared room variable.",
+      "fullName": "Room variable value",
+      "functionType": "StringExpression",
+      "name": "RoomVariableValue",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; eventsFunctionContext.returnValue=mp?String(mp.roomVariables[eventsFunctionContext.getArgument('key')]||''):'';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Variable key",
+          "longDescription": "",
+          "name": "key",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the name of the current pending custom event.",
+      "fullName": "Current custom event name",
+      "functionType": "StringExpression",
+      "name": "CurrentEventName",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const q=mp&&mp.customEvents; eventsFunctionContext.returnValue=q&&q.length>0?q[q.length-1].name:'';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the data of the current pending custom event.",
+      "fullName": "Current custom event data",
+      "functionType": "StringExpression",
+      "name": "CurrentEventData",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const q=mp&&mp.customEvents; eventsFunctionContext.returnValue=q&&q.length>0?q[q.length-1].data||'':'';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the sender ID of the current pending custom event.",
+      "fullName": "Current custom event sender ID",
+      "functionType": "StringExpression",
+      "name": "CurrentEventSender",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const q=mp&&mp.customEvents; eventsFunctionContext.returnValue=q&&q.length>0?q[q.length-1].senderId||'':'';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the name of the current pending RPC call.",
+      "fullName": "Current RPC name",
+      "functionType": "StringExpression",
+      "name": "CurrentRPCName",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const q=mp&&mp.rpcQueue; eventsFunctionContext.returnValue=q&&q.length>0?q[q.length-1].name:'';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the arguments of the current RPC call as a JSON array string.",
+      "fullName": "Current RPC args (JSON)",
+      "functionType": "StringExpression",
+      "name": "CurrentRPCArgs",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const q=mp&&mp.rpcQueue; eventsFunctionContext.returnValue=q&&q.length>0?JSON.stringify(q[q.length-1].args||[]):'[]';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the sender ID of the current RPC call.",
+      "fullName": "Current RPC sender ID",
+      "functionType": "StringExpression",
+      "name": "CurrentRPCSender",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const q=mp&&mp.rpcQueue; eventsFunctionContext.returnValue=q&&q.length>0?q[q.length-1].senderId||'':'';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the text of the latest chat message.",
+      "fullName": "Latest chat message text",
+      "functionType": "StringExpression",
+      "name": "ChatText",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const c=mp&&mp.chatMessages; eventsFunctionContext.returnValue=c&&c.length>0?c[0].text||'':'';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the name of the sender of the latest chat message.",
+      "fullName": "Latest chat sender name",
+      "functionType": "StringExpression",
+      "name": "ChatSenderName",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const c=mp&&mp.chatMessages; eventsFunctionContext.returnValue=c&&c.length>0?c[0].senderName||'':'';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the ID of the sender of the latest chat message.",
+      "fullName": "Latest chat sender ID",
+      "functionType": "StringExpression",
+      "name": "ChatSenderId",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const c=mp&&mp.chatMessages; eventsFunctionContext.returnValue=c&&c.length>0?c[0].senderId||'':'';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the player ID of the player who just joined (valid for one frame).",
+      "fullName": "ID of player who just joined",
+      "functionType": "StringExpression",
+      "name": "PlayerJustJoinedId",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = gdjs.RealTimeMP ? gdjs.RealTimeMP.playerJustJoined : '';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the player ID of the player who just left (valid for one frame).",
+      "fullName": "ID of player who just left",
+      "functionType": "StringExpression",
+      "name": "PlayerJustLeftId",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = gdjs.RealTimeMP ? gdjs.RealTimeMP.playerJustLeft : '';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the player ID of the new host (valid for one frame after host change).",
+      "fullName": "ID of new host",
+      "functionType": "StringExpression",
+      "name": "NewHostId",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = gdjs.RealTimeMP ? gdjs.RealTimeMP.newHostId : '';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Number of rooms in the lobby list.",
+      "fullName": "Lobby room count",
+      "functionType": "Expression",
+      "name": "LobbyRoomCount",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "eventsFunctionContext.returnValue = gdjs.RealTimeMP ? gdjs.RealTimeMP.lobbyRooms.length : 0;",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the ID of a room in the lobby by index.",
+      "fullName": "Lobby room ID",
+      "functionType": "StringExpression",
+      "name": "LobbyRoomId",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const idx=Math.floor(eventsFunctionContext.getArgument('index')); const r=mp&&mp.lobbyRooms[idx]; eventsFunctionContext.returnValue=r?r.id:'';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Room index (0-based)",
+          "longDescription": "",
+          "name": "index",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "expression"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the name of a room in the lobby by index.",
+      "fullName": "Lobby room name",
+      "functionType": "StringExpression",
+      "name": "LobbyRoomName",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const idx=Math.floor(eventsFunctionContext.getArgument('index')); const r=mp&&mp.lobbyRooms[idx]; eventsFunctionContext.returnValue=r?r.name:'';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Room index (0-based)",
+          "longDescription": "",
+          "name": "index",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "expression"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the number of players in a lobby room by index.",
+      "fullName": "Lobby room player count",
+      "functionType": "Expression",
+      "name": "LobbyRoomPlayerCount",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const idx=Math.floor(eventsFunctionContext.getArgument('index')); const r=mp&&mp.lobbyRooms[idx]; eventsFunctionContext.returnValue=r?r.playerCount:0;",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Room index (0-based)",
+          "longDescription": "",
+          "name": "index",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "expression"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the max players of a lobby room by index.",
+      "fullName": "Lobby room max players",
+      "functionType": "Expression",
+      "name": "LobbyRoomMaxPlayers",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const idx=Math.floor(eventsFunctionContext.getArgument('index')); const r=mp&&mp.lobbyRooms[idx]; eventsFunctionContext.returnValue=r?r.maxPlayers:0;",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Room index (0-based)",
+          "longDescription": "",
+          "name": "index",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "expression"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get a JSON array string of all player IDs in the room.",
+      "fullName": "All player IDs (JSON array)",
+      "functionType": "StringExpression",
+      "name": "AllPlayerIds",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; eventsFunctionContext.returnValue=mp?JSON.stringify(Object.keys(mp.roomPlayers)):'[]';",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the X position of a synced object by its ID.",
+      "fullName": "Synced object X",
+      "functionType": "Expression",
+      "name": "SyncedObjectX",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const o=mp&&mp.syncObjects[eventsFunctionContext.getArgument('objectId')]; eventsFunctionContext.returnValue=o?o.x||0:0;",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Object ID",
+          "longDescription": "",
+          "name": "objectId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the Y position of a synced object by its ID.",
+      "fullName": "Synced object Y",
+      "functionType": "Expression",
+      "name": "SyncedObjectY",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const o=mp&&mp.syncObjects[eventsFunctionContext.getArgument('objectId')]; eventsFunctionContext.returnValue=o?o.y||0:0;",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Object ID",
+          "longDescription": "",
+          "name": "objectId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    },
+    {
+      "description": "Get the angle of a synced object by its ID.",
+      "fullName": "Synced object angle",
+      "functionType": "Expression",
+      "name": "SyncedObjectAngle",
+      "private": false,
+      "sentence": "",
+      "events": [
+        {
+          "disabled": false,
+          "folded": false,
+          "type": "BuiltinCommonInstructions::JsCode",
+          "inlineCode": "const mp=gdjs.RealTimeMP; const o=mp&&mp.syncObjects[eventsFunctionContext.getArgument('objectId')]; eventsFunctionContext.returnValue=o?o.angle||0:0;",
+          "parameterObjects": "",
+          "useStrict": true,
+          "eventsSheetExpanded": true
+        }
+      ],
+      "parameters": [
+        {
+          "codeOnly": false,
+          "defaultValue": "",
+          "description": "Object ID",
+          "longDescription": "",
+          "name": "objectId",
+          "optional": false,
+          "supplementaryInformation": "",
+          "type": "string"
+        }
+      ],
+      "objectGroups": []
+    }
+  ],
+  "eventsBasedBehaviors": []
+}
